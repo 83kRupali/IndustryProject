@@ -13,6 +13,12 @@ app = Flask(__name__)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 API_KEY = os.environ.get("SUPABASE_API_KEY")
 
+if not SUPABASE_URL or not API_KEY:
+    raise RuntimeError(
+        "Environment variables SUPABASE_URL or SUPABASE_API_KEY are missing. "
+        "Set them in Render dashboard."
+    )
+
 HEADERS = {
     "apikey": API_KEY,
     "Authorization": f"Bearer {API_KEY}",
