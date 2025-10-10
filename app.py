@@ -146,6 +146,18 @@ def export_csv():
     except Exception as e:
         return jsonify({"error": f"Export failed: {e}"}), 500
 
+
+@app.route("/profile")
+def profile():
+    user = {
+        "name": "John Doe",
+        "email": "john.doe@example.com",
+        "role": "Inventory Manager",
+        "joined": "2023-01-15"
+    }
+    return render_template("profile.html", user=user)
+
+
 # ---------------- Run App ----------------
 if __name__ == "__main__":
     app.run(debug=True)
