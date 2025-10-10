@@ -1,121 +1,145 @@
-import psycopg2
-from flask import Flask, request, jsonify, render_template, send_file
+import os
 import io
 import csv
-import os
+import requests
+from flask import Flask, request, jsonify, render_template, send_file
+from dotenv import load_dotenv
 
-from datetime import datetime
+load_dotenv()  # load .env file
 
 app = Flask(__name__)
 
-def get_db_connection():
-    return psycopg2.connect(
-        host=os.environ.get("DB_HOST"),
-        dbname=os.environ.get("DB_NAME"),
-        user=os.environ.get("DB_USER"),
-        password=os.environ.get("DB_PASSWORD"),
-        port=os.environ.get("DB_PORT"),
-        sslmode="require"
-    )
+# ---------------- Supabase configuration ----------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+API_KEY = os.environ.get("SUPABASE_API_KEY")
 
-# Dashboard route
-@app.route('/')
-def dashboard():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT store_id FROM forecasts ORDER BY store_id")
-    stores = [r[0] for r in cur.fetchall()]
-    cur.execute("SELECT DISTINCT product_id FROM forecasts ORDER BY product_id")
-    skus = [r[0] for r in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return render_template("dashboard.html", stores=stores, skus=skus)
+HEADERS = {
+    "apikey": API_KEY,
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json"
+}
 
-# Profile route
-@app.route('/profile')
-def profile():
-    user = {
-        "name": "John Doe",
-        "email": "john.doe@example.com",
-        "role": "Inventory Manager",
-        "joined": "2023-01-15"
+# ---------------- Helper functions ----------------
+def fetch_distinct(column):
+    """Fetch distinct values for a column"""
+    url = f"{SUPABASE_URL}/rest/v1/forecasts"
+    params = {"select": column}
+    r = requests.get(url, headers=HEADERS, params=params)
+    r.raise_for_status()
+    data = r.json()
+    return sorted({row[column] for row in data if row[column] is not None})
+
+def fetch_forecasts(store_id, product_id, start_date=None, end_date=None):
+    url = f"{SUPABASE_URL}/rest/v1/forecasts"
+    params = {
+        "select": "*",
+        "store_id": f"eq.{store_id}",
+        "product_id": f"eq.{product_id}",
+        "order": "forecast_date.asc"
     }
-    return render_template("profile.html", user=user)
-
-# Forecast API
-@app.route('/forecast', methods=['POST'])
-def forecast():
-    store_id = request.form.get('store_id')
-    product_id = request.form.get('product_id')
-    start_date = request.form.get('start_date')  # optional
-    end_date = request.form.get('end_date')      # optional
-
-    query = "SELECT forecast_date, forecast_qty, model FROM forecasts WHERE store_id=%s AND product_id=%s"
-    params = [store_id, product_id]
-
     if start_date and end_date:
-        query += " AND forecast_date BETWEEN %s AND %s"
-        params += [start_date, end_date]
+        params["forecast_date"] = f"gte.{start_date},lte.{end_date}"
+    r = requests.get(url, headers=HEADERS, params=params)
+    r.raise_for_status()
+    return r.json()
 
-    query += " ORDER BY forecast_date ASC"
+def fetch_top_skus(limit=10):
+    """Fetch top SKUs by total forecast"""
+    url = f"{SUPABASE_URL}/rest/v1/forecasts"
+    params = {"select": "product_id,forecast_qty"}
+    r = requests.get(url, headers=HEADERS, params=params)
+    r.raise_for_status()
+    data = r.json()
+    totals = {}
+    for row in data:
+        pid = row["product_id"]
+        totals[pid] = totals.get(pid, 0) + row["forecast_qty"]
+    # Sort by total descending
+    top = sorted(totals.items(), key=lambda x: x[1], reverse=True)[:limit]
+    return [{"product_id": pid, "total_forecast": total} for pid, total in top]
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(query, params)
-    rows = cur.fetchall()
+def fetch_critical_skus():
+    """SKUs with min forecast < 5"""
+    url = f"{SUPABASE_URL}/rest/v1/forecasts"
+    params = {"select": "product_id,forecast_qty"}
+    r = requests.get(url, headers=HEADERS, params=params)
+    r.raise_for_status()
+    data = r.json()
+    min_qtys = {}
+    for row in data:
+        pid = row["product_id"]
+        min_qtys[pid] = min(min_qtys.get(pid, row["forecast_qty"]), row["forecast_qty"])
+    critical = [{"product_id": pid, "min_qty": q} for pid, q in min_qtys.items() if q < 5]
+    return critical
 
-    # Top 10 SKUs (all stores)
-    cur.execute("SELECT product_id, SUM(forecast_qty) as total_forecast FROM forecasts GROUP BY product_id ORDER BY total_forecast DESC LIMIT 10")
-    top_skus = [{"product_id": r[0], "total_forecast": r[1]} for r in cur.fetchall()]
+# ---------------- Routes ----------------
+@app.route("/")
+def dashboard():
+    try:
+        stores = fetch_distinct("store_id")
+        skus = fetch_distinct("product_id")
+        return render_template("dashboard.html", stores=stores, skus=skus)
+    except Exception as e:
+        return f"Error fetching dashboard data: {e}", 500
 
-    # Critical SKUs (example: min forecast < 5)
-    cur.execute("SELECT product_id, MIN(forecast_qty) FROM forecasts GROUP BY product_id HAVING MIN(forecast_qty)<5")
-    critical_skus = [{"product_id": r[0], "min_qty": r[1]} for r in cur.fetchall()]
+@app.route("/forecast", methods=["POST"])
+def forecast():
+    store_id = request.form.get("store_id")
+    product_id = request.form.get("product_id")
+    start_date = request.form.get("start_date")
+    end_date = request.form.get("end_date")
 
-    cur.close()
-    conn.close()
+    if not store_id or not product_id:
+        return jsonify({"error": "store_id and product_id are required"}), 400
 
-    if rows:
+    try:
+        rows = fetch_forecasts(store_id, product_id, start_date, end_date)
+        if not rows:
+            return jsonify({"error": "No forecast found"}), 404
+
         latest = rows[-1]
-        history = [{"date": r[0].isoformat(), "qty": r[1], "model": r[2]} for r in rows]
-        quantities = [r[1] for r in rows]
-        stats = {"avg": round(sum(quantities)/len(quantities),2), "max": max(quantities), "min": min(quantities)}
+        history = [{"date": r["forecast_date"], "qty": r["forecast_qty"], "model": r["model"]} for r in rows]
+        quantities = [r["forecast_qty"] for r in rows]
+        stats = {"avg": round(sum(quantities)/len(quantities), 2), "max": max(quantities), "min": min(quantities)}
+
         return jsonify({
-            "latest": {"forecast_qty": latest[1], "forecast_date": latest[0].isoformat(), "model": latest[2]},
+            "latest": {"forecast_qty": latest["forecast_qty"], "forecast_date": latest["forecast_date"], "model": latest["model"]},
             "history": history,
             "stats": stats,
-            "top_skus": top_skus,
-            "critical_skus": critical_skus
+            "top_skus": fetch_top_skus(),
+            "critical_skus": fetch_critical_skus()
         })
-    else:
-        return jsonify({"error":"No forecast found"})
+    except Exception as e:
+        return jsonify({"error": f"Query failed: {e}"}), 500
 
-# CSV Export
-@app.route('/export', methods=['POST'])
+@app.route("/export", methods=["POST"])
 def export_csv():
-    store_id = request.form.get('store_id')
-    product_id = request.form.get('product_id')
+    store_id = request.form.get("store_id")
+    product_id = request.form.get("product_id")
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT forecast_date, store_id, product_id, forecast_qty, model FROM forecasts WHERE store_id=%s AND product_id=%s ORDER BY forecast_date",
-        (store_id, product_id)
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    if not store_id or not product_id:
+        return jsonify({"error": "store_id and product_id are required"}), 400
 
-    si = io.StringIO()
-    cw = csv.writer(si)
-    cw.writerow(['forecast_date','store_id','product_id','forecast_qty','model'])
-    cw.writerows(rows)
-    output = io.BytesIO()
-    output.write(si.getvalue().encode('utf-8'))
-    output.seek(0)
+    try:
+        rows = fetch_forecasts(store_id, product_id)
+        if not rows:
+            return jsonify({"error": "No data to export"}), 404
 
-    filename = f"forecast_{store_id}_{product_id}.csv"
-    return send_file(output, as_attachment=True, download_name=filename, mimetype='text/csv')
+        si = io.StringIO()
+        cw = csv.writer(si)
+        cw.writerow(["forecast_date", "store_id", "product_id", "forecast_qty", "model"])
+        for r in rows:
+            cw.writerow([r["forecast_date"], r["store_id"], r["product_id"], r["forecast_qty"], r["model"]])
 
+        output = io.BytesIO()
+        output.write(si.getvalue().encode("utf-8"))
+        output.seek(0)
+
+        filename = f"forecast_{store_id}_{product_id}.csv"
+        return send_file(output, as_attachment=True, download_name=filename, mimetype="text/csv")
+    except Exception as e:
+        return jsonify({"error": f"Export failed: {e}"}), 500
+
+# ---------------- Run App ----------------
 if __name__ == "__main__":
     app.run(debug=True)
